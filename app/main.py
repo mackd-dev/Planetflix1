@@ -1112,6 +1112,38 @@ async def get_current_admin(credentials: HTTPAuthorizationCredentials = Depends(
         logger.error(f"❌ Admin Auth Failed: {str(e)}")
         raise HTTPException(401, "Invalid or expired admin token")
 
+
+def _verify_app_token(authorization: Optional[str]) -> str:
+    """
+    Validates the short-lived per-device app_token issued by /device/register.
+    Returns the device UUID (sub) on success, raises HTTPException on failure.
+
+    The Android app must send:
+        Authorization: Bearer <app_token>
+    on every call to /session/start, /session/heartbeat, and /entitlement.
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or malformed Authorization header. "
+                   "Call /device/register first to obtain an app_token.",
+        )
+    raw_token = authorization.split(" ", 1)[1].strip()
+    try:
+        claims = jwt.decode(raw_token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError as exc:
+        logger.warning(f"❌ App token verification failed: {exc}")
+        raise HTTPException(status_code=401, detail="Invalid or expired app token. Re-register the device.")
+
+    if claims.get("type") != "app":
+        raise HTTPException(status_code=401, detail="Token type mismatch. Expected app token.")
+
+    uuid_from_token = claims.get("sub")
+    if not uuid_from_token:
+        raise HTTPException(status_code=401, detail="Malformed app token: missing sub.")
+
+    return uuid_from_token
+
 # ✅ ZENO SIGNATURE VERIFICATION (OPTIONAL - FIXED)
 def verify_zeno_signature(payload: dict, signature: str) -> bool:
     """
@@ -1345,9 +1377,19 @@ app = FastAPI(title="PixTvMax Production API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # ✅ SECURITY: Restrict CORS to known origins only.
+    #    Add any admin panel or web client domain here.
+    #    "null" is included so local-file admin panels still work during dev;
+    #    remove it once your admin panel is deployed to a real domain.
+    allow_origins=[
+        "https://planetflix.homes",
+        "https://www.planetflix.homes",
+        "https://admin.planetflix.homes",   # add your admin panel URL
+        "null",                             # ⚠️ remove in production
+    ],
+    allow_credentials=True,
     allow_headers=["*"],
-    allow_methods=["*"]
+    allow_methods=["*"],
 )
 
 # 🆕 Channel Link Manager routes
@@ -1504,14 +1546,34 @@ async def get_packages():
 
 
 
+def _safe_discovery_channel(doc: dict) -> dict:
+    """
+    Returns METADATA-ONLY for discovery.
+    ⚠️  Stream URLs, license keys, headers, cookies, referers, origins
+        are NEVER returned here. Real playback data lives in /session/start.
+    """
+    if not doc:
+        return {}
+    return {
+        "id":          doc.get("id") or str(doc.get("_id", "")),
+        "name":        doc.get("name", ""),
+        "logo_url":    doc.get("logo_url") or doc.get("logoUrl") or "",
+        "categoryId":  doc.get("category_id") or doc.get("categoryId"),
+        "isPremium":   bool(doc.get("is_premium") or doc.get("isPremium")),
+        "active":      bool(doc.get("active", True)),
+        "order":       int(doc.get("order", 0)),
+        "alias":       doc.get("alias"),   # non-sensitive label used for routing
+        # ❌ mpd_url, license_url, headers, referer, origin, nv_authorizations
+        #    are intentionally excluded here — see /session/start for playback data
+    }
+
 @app.get("/content/discovery")
 async def get_discovery():
     categories = await categories_col.find().sort("order", 1).to_list(None)
-    channels = await channels_col.find({"active": True}).sort("order", 1).to_list(None)
-    
+    channels   = await channels_col.find({"active": True}).sort("order", 1).to_list(None)
     return {
         "categories": [serialize_doc(c) for c in categories],
-        "channels": [serialize_doc(c) for c in channels]
+        "channels":   [_safe_discovery_channel(c) for c in channels],
     }
 
 # --- GET: Works for both Android App and Admin Panel ---
@@ -1641,6 +1703,8 @@ async def register_device(payload: dict):
             "isPremium": False,
             "isBlocked": False,
             "trialRemaining": flags.get("trialSeconds", 300),
+            "trialStartedAt": datetime.utcnow(),
+            "trialUsed": False,
             "createdAt": datetime.utcnow(),
             "lastSeen": datetime.utcnow()
         })
@@ -1650,7 +1714,21 @@ async def register_device(payload: dict):
             {"$set": {"lastSeen": datetime.utcnow()}}
         )
 
-    return {"status": "OK"}
+    # ✅ SECURITY: Issue a short-lived per-device app token.
+    #    The Android app must send this as  Authorization: Bearer <app_token>
+    #    on /session/start and /session/heartbeat.
+    #    This replaces the old hardcoded bearer token in the APK.
+    app_token = jwt.encode(
+        {
+            "sub": uuid_,
+            "type": "app",
+            "exp": datetime.utcnow() + timedelta(hours=24),
+        },
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+    return {"status": "OK", "app_token": app_token}
 
 @app.get("/device/status/{uuid}")
 async def device_status(uuid: str):
@@ -1734,7 +1812,12 @@ async def start_session(payload: dict, request: Request):
     # logger.info("========== /session/start ==========")
     # logger.info(f"Payload received: {payload}")
     # logger.info(f"Client IP: {request.client.host if request.client else 'unknown'}")
-    
+
+    # ✅ SECURITY: Validate the app_token issued by /device/register.
+    #    This prevents unauthenticated clients from starting sessions directly.
+    authorization = request.headers.get("Authorization") or request.headers.get("authorization")
+    token_uuid = _verify_app_token(authorization)
+
     uuid_ = payload.get("uuid")
     
     # -----------------------------------------------------------
@@ -1747,6 +1830,12 @@ async def start_session(payload: dict, request: Request):
 
     if not uuid_:
         raise HTTPException(400, "UUID required")
+
+    # ✅ SECURITY: Ensure the token was issued for *this* device UUID.
+    #    Prevents one device from starting sessions on behalf of another.
+    if token_uuid != uuid_:
+        logger.warning(f"🚫 Token UUID mismatch | token_sub={token_uuid} | payload_uuid={uuid_}")
+        raise HTTPException(403, "Token does not match the supplied UUID.")
 
     device = await devices_col.find_one({"uuid": uuid_})
     if not device:
@@ -2613,8 +2702,7 @@ async def admin_update_config(config: dict, admin: dict = Depends(get_current_ad
 
 @app.post("/admin/login")
 async def admin_login(payload: dict):
-    # 1. Print what we actually received (for debugging)
-    print(f"DEBUG LOGIN PAYLOAD: {payload}") 
+    # Debug print removed — never log credentials, even in debug mode.
 
     # 2. Check for 'username' OR 'email'
     raw_username = payload.get("username") or payload.get("email")
@@ -3289,17 +3377,31 @@ async def admin_manage_user(
 
 
 @app.api_route("/api/clearkey/{kid_hex}/{key_hex}", methods=["GET", "POST"])
-@app.api_route("/api/clearkey/{kid_hex}/{key_hex}", methods=["GET", "POST"])
 async def clearkey_license_server(kid_hex: str, key_hex: str, request: Request):
     """
     ClearKey license endpoint.
 
-    Note: The Android app primarily uses LocalMediaDrmCallback (keys embedded in drm_data),
-    but keeping this endpoint correct helps WebView/Shaka testing and any future clients.
+    ✅ SECURITY: Requires a valid active session token passed as query param
+    ?token=<session_token> or Authorization: Bearer <session_token>.
+    Without this, any client knowing a KID/key could fetch DRM keys freely.
     """
-    logger.info(f"🔑 ClearKey license requested | KID: {kid_hex}")
+    # Accept token from query-param or Authorization header
+    session_token = (
+        request.query_params.get("token")
+        or (request.headers.get("Authorization", "").split(" ", 1)[1].strip()
+            if request.headers.get("Authorization", "").lower().startswith("bearer ") else None)
+    )
+    if not session_token:
+        raise HTTPException(status_code=401, detail="Session token required for ClearKey endpoint.")
+
+    session = await sessions_col.find_one({"token": session_token, "active": True})
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid or expired session token.")
+    if session.get("expiresAt") and session["expiresAt"] < datetime.utcnow():
+        raise HTTPException(status_code=401, detail="Session token expired.")
+
+    logger.info(f"🔑 ClearKey license requested | KID: {kid_hex} | session: {session_token[:12]}…")
     payload = build_clearkey_json(f"{kid_hex}:{key_hex}")
-    # Some players expect 'type' in the JSON (e.g., 'temporary')
     if isinstance(payload, dict) and 'type' not in payload:
         payload['type'] = 'temporary'
     return JSONResponse(
@@ -3312,13 +3414,22 @@ async def clearkey_license_server(kid_hex: str, key_hex: str, request: Request):
         },
     )
 @app.post("/session/heartbeat")
-async def session_heartbeat(payload: dict):
+async def session_heartbeat(payload: dict, request: Request):
+    # ✅ SECURITY: Validate the per-device app_token before processing heartbeat.
+    authorization = request.headers.get("Authorization") or request.headers.get("authorization")
+    token_uuid = _verify_app_token(authorization)
+
     token = payload.get("token")
     uuid_ = payload.get("uuid")
     seconds = payload.get("seconds", 30)
     
     if not token or not uuid_:
         raise HTTPException(400, "Token and UUID required")
+
+    # ✅ Ensure the app_token was issued for this device
+    if token_uuid != uuid_:
+        logger.warning(f"🚫 Heartbeat token UUID mismatch | token_sub={token_uuid} | payload_uuid={uuid_}")
+        raise HTTPException(403, "Token does not match the supplied UUID.")
     
     session = await sessions_col.find_one({"token": token, "uuid": uuid_, "active": True})
     if not session:
@@ -3416,16 +3527,12 @@ async def session_heartbeat(payload: dict):
     # ============================================================================
     if not is_premium:
         remaining = int(device.get("trialRemaining") or 0)
+        # ✅ SECURITY FIX: Do NOT silently reset trial to 5s when it hits 0.
+        #    The old code re-granted free seconds on every heartbeat when
+        #    remaining==0, making the paywall trivially bypassable.
+        #    Trial seconds are now only ever set server-side at downgrade time.
         if remaining <= 0:
-            TRIAL_AFTER_DOWNGRADE = 5
-            await devices_col.update_one(
-                {"uuid": uuid_},
-                {"$set": {"trialRemaining": TRIAL_AFTER_DOWNGRADE, "trialUsed": False, "trialPausedAt": None}}
-            )
-            remaining = TRIAL_AFTER_DOWNGRADE
-            device["trialRemaining"] = remaining
-            device["trialUsed"] = False
-            logger.info(f"🔄 Reset trial for free user {uuid_} to 5s")
+            pass  # fall through to paywall check below
 
     # ============================================================================
     # CHECK IF WATCHING PREMIUM CHANNEL (Only matters for free users)
@@ -3494,12 +3601,12 @@ async def session_heartbeat(payload: dict):
 
 # ✅ THIS IS THE NEW PART YOU ARE ADDING:
 @app.post("/playback/heartbeat")
-async def playback_heartbeat_alias(payload: dict):
+async def playback_heartbeat_alias(payload: dict, request: Request):
     """
     🔀 ALIAS: Redirects /playback/heartbeat -> /session/heartbeat
     This ensures the Android app connects successfully.
     """
-    return await session_heartbeat(payload)
+    return await session_heartbeat(payload, request)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
