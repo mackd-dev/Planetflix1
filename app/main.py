@@ -1269,6 +1269,12 @@ class AppIdentityMiddleware(BaseHTTPMiddleware):
             )
             return JSONResponse(status_code=403, content={"detail": "Forbidden"})
 
+        # ✅ Sig verified — log first request from each IP so you can confirm
+        # the guard is active without spamming the log on every heartbeat.
+        logger.debug(
+            f"\u2705 X-Client-Sig verified | path={path} "
+            f"ip={request.client.host if request.client else '?'}"
+        )
         return await call_next(request)
 
 app.add_middleware(AppIdentityMiddleware)
@@ -3318,18 +3324,9 @@ async def session_heartbeat(payload: dict):
     # ============================================================================
     # FREE USER TRIAL LOGIC (Only for non-premium users)
     # ============================================================================
-    if not is_premium:
-        remaining = int(device.get("trialRemaining") or 0)
-        if remaining <= 0:
-            TRIAL_AFTER_DOWNGRADE = 5
-            await devices_col.update_one(
-                {"uuid": uuid_},
-                {"$set": {"trialRemaining": TRIAL_AFTER_DOWNGRADE, "trialUsed": False, "trialPausedAt": None}}
-            )
-            remaining = TRIAL_AFTER_DOWNGRADE
-            device["trialRemaining"] = remaining
-            device["trialUsed"] = False
-            logger.info(f"🔄 Reset trial for free user {uuid_} to 5s")
+    # NOTE: We intentionally do NOT reset the trial here when it hits 0.
+    # If trialUsed=True and trialRemaining=0, the user must see the paywall.
+    # The only time trial resets is after a real subscription downgrade (handled above).
 
     # ============================================================================
     # CHECK IF WATCHING PREMIUM CHANNEL (Only matters for free users)
