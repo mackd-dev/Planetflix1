@@ -2554,7 +2554,7 @@ async def get_payment_provider(admin: dict = Depends(get_current_admin)):
 
 @app.put("/admin/payment-provider")
 async def set_payment_provider(
-    payload: dict,
+    payload: dict = Body(...),
     admin: dict = Depends(get_current_admin)
 ):
     """🔀 SET active payment provider — live switch, no restart needed"""
