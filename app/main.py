@@ -1281,13 +1281,16 @@ app.add_middleware(AppIdentityMiddleware)
 
 # ── Payment provider switch — registered BEFORE channel_routes to avoid wildcard shadowing ──
 @app.get("/admin/payment-provider")
+@app.get("/admin/payment-provider/")
 async def get_payment_provider(admin: dict = Depends(get_current_admin)):
     """🔀 GET active payment provider"""
     provider = await get_active_provider()
+    logger.info(f"🔎 Admin requested active payment provider -> {provider.upper()}")
     return {"paymentProvider": provider}
 
 
 @app.put("/admin/payment-provider")
+@app.put("/admin/payment-provider/")
 async def set_payment_provider(
     payload: dict = Body(...),
     admin: dict = Depends(get_current_admin)
@@ -1297,12 +1300,15 @@ async def set_payment_provider(
     if provider not in ("zeno", "sonic"):
         raise HTTPException(400, "paymentProvider must be 'zeno' or 'sonic'")
 
-    await config_col.update_one(
+    result = await config_col.update_one(
         {"name": "global"},
         {"$set": {"paymentProvider": provider}},
         upsert=True
     )
-    logger.info(f"🔀 Payment provider switched to: {provider.upper()}")
+    logger.info(
+        f"🔀 Payment provider switched to: {provider.upper()} | "
+        f"matched={result.matched_count} modified={result.modified_count} upserted={result.upserted_id}"
+    )
     return {"paymentProvider": provider, "message": f"Switched to {provider.upper()} successfully"}
 
 
@@ -1376,10 +1382,21 @@ async def startup():
         logger.warning(
             "⚠️  APP_CLIENT_SECRET is not set! "
             "The app identity guard is DISABLED — any client can reach your API. "
-            "Generate one: python3 -c "import secrets; print(secrets.token_hex(16))""
+            "Generate one: python3 -c 'import secrets; print(secrets.token_hex(16))'"
         )
     else:
         logger.info(f"✅ APP_CLIENT_SECRET configured — app identity guard is ACTIVE")
+
+    admin_routes = sorted(
+        f"{','.join(sorted(getattr(r, 'methods', []) or []))} {r.path}"
+        for r in app.routes
+        if str(getattr(r, "path", "")).startswith("/admin")
+    )
+    logger.info(f"📌 Registered admin routes: {admin_routes}")
+    logger.info(
+        "✅ Payment provider endpoint registered: "
+        f"{any(str(getattr(r, 'path', '')) in ('/admin/payment-provider', '/admin/payment-provider/') for r in app.routes)}"
+    )
 
     # ✅ ONESIGNAL VALIDATION
     if not ONESIGNAL_APP_ID:
