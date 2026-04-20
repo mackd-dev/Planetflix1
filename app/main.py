@@ -267,7 +267,9 @@ ASPORTSHD_BYPASS_CODE = os.getenv("ASPORTSHD_BYPASS_CODE", "491YWB317")
 
 # Package name sent as X-Package-Name header when scraping streams
 # (mimics the source app to bypass their auth checks)
-APP_PACKAGE_NAME = os.getenv("APP_PACKAGE_NAME", APP_PACKAGE_NAME)
+APP_PACKAGE_NAME = os.getenv("APP_PACKAGE_NAME")
+if not APP_PACKAGE_NAME:
+    raise RuntimeError("❌ APP_PACKAGE_NAME environment variable is not set")
 
 # Default display name used as buyer_name when app doesn't send one
 APP_DISPLAY_NAME = os.getenv("APP_DISPLAY_NAME", "PlanetFlix User")
