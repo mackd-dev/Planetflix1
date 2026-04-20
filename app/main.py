@@ -1279,6 +1279,33 @@ class AppIdentityMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(AppIdentityMiddleware)
 
+# ── Payment provider switch — registered BEFORE channel_routes to avoid wildcard shadowing ──
+@app.get("/admin/payment-provider")
+async def get_payment_provider(admin: dict = Depends(get_current_admin)):
+    """🔀 GET active payment provider"""
+    provider = await get_active_provider()
+    return {"paymentProvider": provider}
+
+
+@app.put("/admin/payment-provider")
+async def set_payment_provider(
+    payload: dict = Body(...),
+    admin: dict = Depends(get_current_admin)
+):
+    """🔀 SET active payment provider — live switch, no restart needed"""
+    provider = (payload.get("paymentProvider") or "").strip().lower()
+    if provider not in ("zeno", "sonic"):
+        raise HTTPException(400, "paymentProvider must be 'zeno' or 'sonic'")
+
+    await config_col.update_one(
+        {"name": "global"},
+        {"$set": {"paymentProvider": provider}},
+        upsert=True
+    )
+    logger.info(f"🔀 Payment provider switched to: {provider.upper()}")
+    return {"paymentProvider": provider, "message": f"Switched to {provider.upper()} successfully"}
+
+
 # 🆕 Channel Link Manager routes
 setup_channel_routes(app, db, get_current_admin)
 
@@ -2545,30 +2572,6 @@ async def admin_update_config(config: dict, admin: dict = Depends(get_current_ad
 
 
 
-@app.get("/admin/payment-provider")
-async def get_payment_provider(admin: dict = Depends(get_current_admin)):
-    """🔀 GET active payment provider"""
-    provider = await get_active_provider()
-    return {"paymentProvider": provider}
-
-
-@app.put("/admin/payment-provider")
-async def set_payment_provider(
-    payload: dict = Body(...),
-    admin: dict = Depends(get_current_admin)
-):
-    """🔀 SET active payment provider — live switch, no restart needed"""
-    provider = (payload.get("paymentProvider") or "").strip().lower()
-    if provider not in ("zeno", "sonic"):
-        raise HTTPException(400, "paymentProvider must be 'zeno' or 'sonic'")
-
-    await config_col.update_one(
-        {"name": "global"},
-        {"$set": {"paymentProvider": provider}},
-        upsert=True
-    )
-    logger.info(f"🔀 Payment provider switched to: {provider.upper()}")
-    return {"paymentProvider": provider, "message": f"Switched to {provider.upper()} successfully"}
 
 
 @app.post("/admin/login")
