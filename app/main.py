@@ -386,6 +386,10 @@ schedules_col = db.schedules
 vipindi_col = db.vipindi
 reminders_col = db.reminders
 banners_col = db.banners
+ip_registry_col = db.ip_registry  # 🛡️ IP Guard: tracks IP → UUID bindings
+
+# IP Guard: auto-block threshold (clones before automatic block)
+IP_GUARD_AUTO_BLOCK_THRESHOLD = int(os.getenv("IP_GUARD_AUTO_BLOCK_THRESHOLD", "3"))
 
 # Channel Link Manager scheduler handle
 channel_scheduler = None  # initialized on startup
@@ -1360,6 +1364,7 @@ async def startup():
     await payments_col.create_index("order_id")
     await payments_col.create_index("status")
     await devices_col.create_index("uuid", unique=True)
+    await ip_registry_col.create_index("ip", unique=True)  # 🛡️ IP Guard index
     
     # ✅ ZENO STARTUP VALIDATION
     if not ZENO_API_KEY:
@@ -1621,10 +1626,87 @@ async def add_reminder(payload: dict = Body(...)):
         logger.error(f"Reminder Error: {e}")
         raise HTTPException(500, "Could not set reminder")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🛡️ IP GUARD HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _ip_guard_record(ip: str, uuid_: str) -> None:
+    """
+    Called on every /device/register.
+    - First registration from an IP → creates a clean binding record.
+    - Same UUID from same IP → just updates last_seen (normal re-launch).
+    - Different UUID from same IP → clone attempt; increments counter.
+      Auto-blocks the device when clone_attempts reaches the threshold.
+    """
+    if not ip or ip in ("unknown", "127.0.0.1", "::1"):
+        return  # skip loopback / unknown
+
+    now = datetime.utcnow()
+    existing = await ip_registry_col.find_one({"ip": ip})
+
+    if not existing:
+        await ip_registry_col.insert_one({
+            "ip":                   ip,
+            "first_uuid":           uuid_,
+            "registered_at":        now,
+            "last_seen":            now,
+            "clone_attempts":       0,
+            "last_clone_uuid":      None,
+            "last_clone_at":        None,
+            "bound_device_blocked": False,
+            "uuid_count":           1,
+            "blocked_uuid":         None,
+            "blocked_at":           None,
+            "block_reason":         None,
+            "status":               "CLEAN",
+        })
+        logger.info(f"🛡️ IP Guard: New binding {ip} → {uuid_[:12]}…")
+        return
+
+    if existing.get("first_uuid") == uuid_:
+        await ip_registry_col.update_one({"ip": ip}, {"$set": {"last_seen": now}})
+        return
+
+    # Different UUID from same IP → clone attempt
+    new_attempts   = existing.get("clone_attempts", 0) + 1
+    new_uuid_count = existing.get("uuid_count", 1) + 1
+    auto_block     = new_attempts >= IP_GUARD_AUTO_BLOCK_THRESHOLD
+
+    update = {
+        "last_seen":       now,
+        "clone_attempts":  new_attempts,
+        "last_clone_uuid": uuid_,
+        "last_clone_at":   now,
+        "uuid_count":      new_uuid_count,
+    }
+
+    if auto_block and not existing.get("bound_device_blocked"):
+        reason = f"IP Guard auto-block after {new_attempts} clone attempts"
+        update["bound_device_blocked"] = True
+        update["blocked_uuid"]         = uuid_
+        update["blocked_at"]           = now
+        update["block_reason"]         = reason
+        update["status"]               = "BLOCKED"
+        await devices_col.update_one(
+            {"uuid": uuid_},
+            {"$set": {"isBlocked": True, "blockReason": reason, "blockedAt": now}}
+        )
+        logger.warning(f"🚫 IP Guard AUTO-BLOCK: {ip} ({new_attempts} clones) → blocked uuid={uuid_[:12]}…")
+    else:
+        update["status"] = "WATCHLIST" if new_attempts > 0 else "CLEAN"
+        logger.warning(f"⚠️ IP Guard clone hit #{new_attempts}: {ip} (bound={existing.get('first_uuid','?')[:12]}… new={uuid_[:12]}…)")
+
+    await ip_registry_col.update_one({"ip": ip}, {"$set": update})
+
+
 @app.post("/device/register")
-async def register_device(payload: dict):
+async def register_device(payload: dict, request: Request):
     uuid_ = payload.get("uuid")
     if not uuid_: raise HTTPException(400, "UUID required")
+
+    # 🛡️ IP Guard — track IP → UUID binding BEFORE creating the device record
+    client_ip = request.client.host if request.client else "unknown"
+    await _ip_guard_record(client_ip, uuid_)
 
     device = await devices_col.find_one({"uuid": uuid_})
     if not device:
@@ -2198,6 +2280,7 @@ async def admin_users(admin: dict = Depends(get_current_admin)):
 
 # 🔧 PATCH 2 – USE for_admin=True IN ADMIN ENDPOINTS
 @app.get("/api/channels")
+@app.get("/admin/channels")
 async def admin_channels(admin: dict = Depends(get_current_admin)):
     channels = await channels_col.find().sort("order", 1).to_list(None)
     return [serialize_doc(c, for_admin=True) for c in channels]
@@ -2220,6 +2303,7 @@ async def admin_reorder_channels(reorder_data: List[Dict[str, Any]] = Body(...),
 
 # 🔧 PATCH 3 – BLOCK INVALID WIDEVINE CHANNELS (CRITICAL)
 @app.post("/api/channels")
+@app.post("/admin/channels")
 async def admin_create_channel(channel: Channel, admin: dict = Depends(get_current_admin)):
     # 🔧 PATCH 3 – BLOCK INVALID WIDEVINE CHANNELS (CRITICAL)
     if channel.drm_type == "WIDEVINE":
@@ -2261,6 +2345,7 @@ async def admin_create_channel(channel: Channel, admin: dict = Depends(get_curre
 
 
 @app.put("/api/channels/{channel_id}")
+@app.put("/admin/channels/{channel_id}")
 async def admin_update_channel(channel_id: str, channel: Channel, admin: dict = Depends(get_current_admin)):
     # Removed strict validation for mpd_url or alias presence
 
@@ -2396,6 +2481,7 @@ async def admin_update_channel(channel_id: str, channel: Channel, admin: dict = 
     return serialize_doc(updated_doc, for_admin=True)
 
 @app.delete("/api/channels/{channel_id}")
+@app.delete("/admin/channels/{channel_id}")
 async def admin_delete_channel(channel_id: str, admin: dict = Depends(get_current_admin)):
     await channels_col.delete_one({"id": channel_id})
     return {"status": "OK"}
@@ -2489,6 +2575,145 @@ async def admin_delete_banner(banner_id: str, admin: dict = Depends(get_current_
     return {"status": "success"}
 
 from bson import ObjectId
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 🛡️ IP GUARD ADMIN ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _serialize_ip_record(doc: dict) -> dict:
+    """Convert MongoDB ip_registry doc to the shape IpRecord.fromJson() expects."""
+    if not doc:
+        return {}
+    def _iso(v):
+        if v is None:
+            return None
+        if hasattr(v, "isoformat"):
+            return v.isoformat()
+        return str(v)
+    return {
+        "ip":                   doc.get("ip", ""),
+        "first_uuid":           doc.get("first_uuid"),
+        "registered_at":        _iso(doc.get("registered_at")),
+        "last_seen":            _iso(doc.get("last_seen")),
+        "clone_attempts":       doc.get("clone_attempts", 0),
+        "last_clone_uuid":      doc.get("last_clone_uuid"),
+        "last_clone_at":        _iso(doc.get("last_clone_at")),
+        "bound_device_blocked": doc.get("bound_device_blocked", False),
+        "uuid_count":           doc.get("uuid_count", 1),
+        "blocked_uuid":         doc.get("blocked_uuid"),
+        "blocked_at":           _iso(doc.get("blocked_at")),
+        "block_reason":         doc.get("block_reason"),
+        "status":               (doc.get("status") or "CLEAN").upper(),
+    }
+
+@app.get("/admin/ip-registry")
+async def admin_ip_registry(admin: dict = Depends(get_current_admin)):
+    """Returns all IP registry records, newest activity first."""
+    docs = await ip_registry_col.find().sort("last_seen", -1).to_list(None)
+    return [_serialize_ip_record(d) for d in docs]
+
+
+@app.post("/admin/ip-registry/block")
+async def admin_ip_block(
+    payload: dict = Body(...),
+    admin: dict = Depends(get_current_admin)
+):
+    """Manually block the device bound to an IP.
+    Body: { "ip": "x.x.x.x", "reason": "optional reason" }
+    """
+    ip     = (payload.get("ip") or "").strip()
+    reason = (payload.get("reason") or "Manually blocked via IP Guard").strip()
+    if not ip:
+        raise HTTPException(400, "ip is required")
+
+    now    = datetime.utcnow()
+    record = await ip_registry_col.find_one({"ip": ip})
+    if not record:
+        raise HTTPException(404, f"No IP Guard record found for {ip}")
+
+    bound_uuid = record.get("first_uuid")
+    if bound_uuid:
+        await devices_col.update_one(
+            {"uuid": bound_uuid},
+            {"$set": {"isBlocked": True, "blockReason": reason, "blockedAt": now}}
+        )
+    await ip_registry_col.update_one(
+        {"ip": ip},
+        {"$set": {
+            "bound_device_blocked": True,
+            "blocked_uuid":         bound_uuid,
+            "blocked_at":           now,
+            "block_reason":         reason,
+            "status":               "BLOCKED",
+            "last_seen":            now,
+        }}
+    )
+    logger.info(f"🚫 Admin manually blocked IP {ip} (uuid={bound_uuid}) reason='{reason}'")
+    return {"status": "ok", "ip": ip, "blocked_uuid": bound_uuid}
+
+
+@app.post("/admin/ip-registry/unblock")
+async def admin_ip_unblock(
+    payload: dict = Body(...),
+    admin: dict = Depends(get_current_admin)
+):
+    """Unblock and reset the IP record.
+    Body: { "ip": "x.x.x.x" }  OR  { "uuid": "device-uuid" }
+    """
+    ip    = (payload.get("ip") or "").strip() or None
+    uuid_ = (payload.get("uuid") or "").strip() or None
+
+    if not ip and not uuid_:
+        raise HTTPException(400, "Either ip or uuid is required")
+
+    if ip:
+        record = await ip_registry_col.find_one({"ip": ip})
+    else:
+        record = await ip_registry_col.find_one({
+            "$or": [{"first_uuid": uuid_}, {"blocked_uuid": uuid_}]
+        })
+
+    if not record:
+        raise HTTPException(404, "No IP Guard record found")
+
+    ip         = record["ip"]
+    bound_uuid = record.get("first_uuid") or record.get("blocked_uuid")
+
+    if bound_uuid:
+        await devices_col.update_one(
+            {"uuid": bound_uuid},
+            {"$set": {"isBlocked": False}, "$unset": {"blockReason": "", "blockedAt": ""}}
+        )
+    await ip_registry_col.update_one(
+        {"ip": ip},
+        {"$set": {
+            "bound_device_blocked": False,
+            "blocked_uuid":         None,
+            "blocked_at":           None,
+            "block_reason":         None,
+            "clone_attempts":       0,
+            "last_clone_uuid":      None,
+            "last_clone_at":        None,
+            "status":               "CLEAN",
+            "last_seen":            datetime.utcnow(),
+        }}
+    )
+    logger.info(f"✅ Admin unblocked IP {ip} (uuid={bound_uuid})")
+    return {"status": "ok", "ip": ip, "unblocked_uuid": bound_uuid}
+
+
+@app.delete("/admin/ip-registry/{ip}")
+async def admin_ip_delete(ip: str, admin: dict = Depends(get_current_admin)):
+    """Hard-delete an IP registry entry — next registration starts fresh.
+    Does NOT change the device block status in devices collection.
+    """
+    ip = urllib.parse.unquote(ip)
+    result = await ip_registry_col.delete_one({"ip": ip})
+    if result.deleted_count == 0:
+        raise HTTPException(404, f"No IP Guard record found for {ip}")
+    logger.info(f"🗑️ Admin deleted IP registry record for {ip}")
+    return {"status": "ok", "ip": ip}
+
 
 @app.get("/admin/schedules")
 async def admin_schedules(admin: dict = Depends(get_current_admin)):
