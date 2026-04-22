@@ -1439,6 +1439,15 @@ async def root():
     # Deliberately vague — do not leak the internal service name
     return {"status": "OK"}
 
+@app.get("/health")
+async def health():
+    return {
+        "status": "OK",
+        "app_identity_guard": bool(APP_CLIENT_SECRET),
+        "public_api_token_configured": bool(PUBLIC_API_TOKEN),
+        "onesignal_configured": bool(ONESIGNAL_APP_ID),
+    }
+
 @app.get("/config")
 async def get_config():
     flags = await get_admin_flags()
